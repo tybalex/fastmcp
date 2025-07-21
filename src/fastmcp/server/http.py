@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import AsyncGenerator, Callable, Generator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
@@ -38,15 +40,110 @@ _current_http_request: ContextVar[Request | None] = ContextVar(
 )
 
 
+# Global storage for HTTP requests by task/session
+# This is a workaround for async context isolation issues
+
+
+# temp fix: use global request store
+class ThreadSafeRequestStore:
+    """Thread-safe storage for HTTP requests across async tasks."""
+
+    def __init__(self, cleanup_interval: float = 30.0):
+        self._store: dict[str, tuple[Request, float]] = {}
+        self._lock = threading.RLock()  # Reentrant lock for nested access
+        self._cleanup_interval = cleanup_interval
+
+    def store_request(self, token: str, request: Request) -> None:
+        """Store a request with timestamp."""
+        with self._lock:
+            self._store[token] = (request, time.time())
+
+    def get_most_recent_request(self) -> tuple[Request, str, float] | None:
+        """Get the most recent request. Returns (request, token, age) or None."""
+        with self._lock:
+            self._cleanup_expired()
+            if not self._store:
+                return None
+
+            # Find the most recent entry
+            token, (request, timestamp) = max(
+                self._store.items(), key=lambda x: x[1][1]
+            )
+            age = time.time() - timestamp
+            return request, token, age
+
+    def get_request_by_token(self, token: str) -> tuple[Request, float] | None:
+        """Get a specific request by token. Returns (request, age) or None."""
+        with self._lock:
+            self._cleanup_expired()
+            if token in self._store:
+                request, timestamp = self._store[token]
+                age = time.time() - timestamp
+                return request, age
+            return None
+
+    def remove_request(self, token: str) -> bool:
+        """Remove a specific request. Returns True if removed, False if not found."""
+        with self._lock:
+            if token in self._store:
+                del self._store[token]
+                return True
+            return False
+
+    def _cleanup_expired(self) -> int:
+        """Remove expired entries. Returns count of removed entries."""
+        current_time = time.time()
+        expired_tokens = [
+            token
+            for token, (_, timestamp) in self._store.items()
+            if current_time - timestamp > self._cleanup_interval
+        ]
+        for token in expired_tokens:
+            del self._store[token]
+        return len(expired_tokens)
+
+    def cleanup_expired(self) -> int:
+        """Public method to force cleanup of expired entries."""
+        with self._lock:
+            return self._cleanup_expired()
+
+    def get_stats(self) -> dict[str, int]:
+        """Get statistics about the store."""
+        with self._lock:
+            expired_count = self._cleanup_expired()
+            return {
+                "active_requests": len(self._store),
+                "cleaned_expired": expired_count,
+            }
+
+    def clear(self) -> None:
+        """Clear all entries."""
+        with self._lock:
+            self._store.clear()
+
+
+# Global instance
+_global_request_store = ThreadSafeRequestStore()
+
+
 class StarletteWithLifespan(Starlette):
     @property
     def lifespan(self) -> Lifespan:
         return self.router.lifespan_context
 
 
+# temp fix: use global request store
 @contextmanager
 def set_http_request(request: Request) -> Generator[Request, None, None]:
+    access_token = request.headers.get("x-forwarded-access-token", "NONE")
+
+    # Store in both ContextVar and global store as a workaround
     token = _current_http_request.set(request)
+
+    # Store in global store using token as key for cross-task access
+    if access_token != "NONE":
+        _global_request_store.store_request(access_token, request)
+
     try:
         yield request
     finally:

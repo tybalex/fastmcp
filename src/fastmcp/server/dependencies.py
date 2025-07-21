@@ -37,11 +37,29 @@ def get_context() -> Context:
 
 
 def get_http_request() -> Request:
-    from fastmcp.server.http import _current_http_request
+    import asyncio
 
-    request = _current_http_request.get()
-    if request is None:
-        raise RuntimeError("No active HTTP request found.")
+    from fastmcp.server.http import _current_http_request, _global_request_store
+
+    task = asyncio.current_task()
+    task_name = getattr(task, "get_name", lambda: str(task))()
+
+    # Check if we're in an MCP server task - if so, always use global store
+    is_mcp_task = "mcp.server" in task_name if task_name else False
+
+    # Try to get from ContextVar first (but skip if we're in MCP task)
+    request = None if is_mcp_task else _current_http_request.get()
+
+    if request is None or is_mcp_task:
+        # Fallback: check global store (this is our workaround for cross-task access)
+
+        # Get the most recent request
+        result = _global_request_store.get_most_recent_request()
+        if result:
+            request, _, _ = result
+        else:
+            raise RuntimeError("No active HTTP request found.")
+
     return request
 
 
