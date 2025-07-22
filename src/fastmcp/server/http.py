@@ -53,10 +53,10 @@ class ThreadSafeRequestStore:
         self._lock = threading.RLock()  # Reentrant lock for nested access
         self._cleanup_interval = cleanup_interval
 
-    def store_request(self, token: str, request: Request) -> None:
+    def store_request(self, key: str, request: Request) -> None:
         """Store a request with timestamp."""
         with self._lock:
-            self._store[token] = (request, time.time())
+            self._store[key] = (request, time.time())
 
     def get_most_recent_request(self) -> tuple[Request, str, float] | None:
         """Get the most recent request. Returns (request, token, age) or None."""
@@ -82,11 +82,11 @@ class ThreadSafeRequestStore:
                 return request, age
             return None
 
-    def remove_request(self, token: str) -> bool:
+    def remove_request(self, key: str) -> bool:
         """Remove a specific request. Returns True if removed, False if not found."""
         with self._lock:
-            if token in self._store:
-                del self._store[token]
+            if key in self._store:
+                del self._store[key]
                 return True
             return False
 
@@ -94,12 +94,12 @@ class ThreadSafeRequestStore:
         """Remove expired entries. Returns count of removed entries."""
         current_time = time.time()
         expired_tokens = [
-            token
-            for token, (_, timestamp) in self._store.items()
+            key
+            for key, (_, timestamp) in self._store.items()
             if current_time - timestamp > self._cleanup_interval
         ]
-        for token in expired_tokens:
-            del self._store[token]
+        for key in expired_tokens:
+            del self._store[key]
         return len(expired_tokens)
 
     def cleanup_expired(self) -> int:
@@ -135,14 +135,14 @@ class StarletteWithLifespan(Starlette):
 # temp fix: use global request store
 @contextmanager
 def set_http_request(request: Request) -> Generator[Request, None, None]:
-    access_token = request.headers.get("x-forwarded-access-token", "NONE")
+    mcp_session_id = request.headers.get("mcp-session-id", "NONE")
 
     # Store in both ContextVar and global store as a workaround
     token = _current_http_request.set(request)
 
     # Store in global store using token as key for cross-task access
-    if access_token != "NONE":
-        _global_request_store.store_request(access_token, request)
+    if mcp_session_id != "NONE":
+        _global_request_store.store_request(mcp_session_id, request)
 
     try:
         yield request
